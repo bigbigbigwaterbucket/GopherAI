@@ -34,10 +34,26 @@ type OpenAIModel struct {
 	llm model.ToolCallingChatModel
 }
 
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func NewOpenAIModel(ctx context.Context) (*OpenAIModel, error) {
-	key := os.Getenv("OPENAI_API_KEY")
-	modelName := os.Getenv("OPENAI_MODEL_NAME")
-	baseURL := os.Getenv("OPENAI_BASE_URL")
+	key := firstEnv("ALI_API_KEY", "OPENAI_API_KEY")
+	modelName := firstEnv("ALI_MODEL_NAME", "OPENAI_MODEL_NAME")
+	baseURL := firstEnv("ALI_BASE_URL", "OPENAI_BASE_URL")
+
+	if key == "" {
+		return nil, fmt.Errorf("未设置 API Key: 请设置环境变量")
+	}
+	if baseURL == "" {
+		return nil, fmt.Errorf("未设置 Chat BaseURL: OPENAI_BASE_URL / ALI_BASE_URL")
+	}
 
 	llm, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		BaseURL: baseURL,
@@ -145,7 +161,10 @@ type AliRAGModel struct {
 }
 
 func NewAliRAGModel(ctx context.Context, username string) (*AliRAGModel, error) {
-	key := os.Getenv("OPENAI_API_KEY")
+	key := firstEnv("ALI_API_KEY", "OPENAI_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("未设置 API Key: 请设置环境变量 ALI_API_KEY 或 OPENAI_API_KEY（RAG 对话与向量共用百炼兼容接口）")
+	}
 	conf := config.GetConfig()
 	modelName := conf.RagModelConfig.RagChatModelName
 	baseURL := conf.RagModelConfig.RagBaseUrl
@@ -317,7 +336,10 @@ type MCPModel struct {
 
 // NewMCPModel 创建MCP模型实例
 func NewMCPModel(ctx context.Context, username string) (*MCPModel, error) {
-	key := os.Getenv("OPENAI_API_KEY")
+	key := firstEnv("ALI_API_KEY", "OPENAI_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("未设置 API Key: 请设置环境变量 ALI_API_KEY 或 OPENAI_API_KEY")
+	}
 	conf := config.GetConfig()
 	modelName := conf.RagModelConfig.RagChatModelName
 	baseURL := conf.RagModelConfig.RagBaseUrl

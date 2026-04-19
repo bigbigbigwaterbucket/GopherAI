@@ -19,27 +19,6 @@
             type="email"
           />
         </el-form-item>
-        <el-form-item label="验证码" prop="captcha">
-          <el-row :gutter="10">
-            <el-col :span="16">
-              <el-input
-                v-model="registerForm.captcha"
-                placeholder="请输入验证码"
-              />
-            </el-col>
-            <el-col :span="8">
-              <el-button
-                type="primary"
-                :loading="codeLoading"
-                :disabled="countdown > 0"
-                @click="sendCode"
-                style="width: 100%"
-              >
-                {{ countdown > 0 ? `${countdown}s` : '发送验证码' }}
-              </el-button>
-            </el-col>
-          </el-row>
-        </el-form-item>
         <el-form-item label="密码" prop="password">
           <el-input
             v-model="registerForm.password"
@@ -81,6 +60,7 @@
 </template>
 
 <script>
+// 验证码流程已关闭：与后端 enableRegisterCaptcha=false 对应
 import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -92,12 +72,9 @@ export default {
     const router = useRouter()
     const registerFormRef = ref()
     const loading = ref(false)
-    const codeLoading = ref(false)
-    const countdown = ref(0)
 
     const registerForm = reactive({
       email: '',
-      captcha: '',
       password: '',
       confirmPassword: ''
     })
@@ -115,9 +92,6 @@ export default {
         { required: true, message: '请输入邮箱', trigger: 'blur' },
         { type: 'email', message: '请输入正确的邮箱格式', trigger: 'blur' }
       ],
-      captcha: [
-        { required: true, message: '请输入验证码', trigger: 'blur' }
-      ],
       password: [
         { required: true, message: '请输入密码', trigger: 'blur' },
         { min: 6, message: '密码长度不能少于6位', trigger: 'blur' }
@@ -128,42 +102,13 @@ export default {
       ]
     }
 
-    const sendCode = async () => {
-      if (!registerForm.email) {
-        ElMessage.warning('请先输入邮箱')
-        return
-      }
-      try {
-        codeLoading.value = true
-        const response = await api.post('/user/captcha', { email: registerForm.email })
-        if (response.data.status_code === 1000) {
-          ElMessage.success('验证码发送成功')
-          countdown.value = 60
-          const timer = setInterval(() => {
-            countdown.value--
-            if (countdown.value <= 0) {
-              clearInterval(timer)
-            }
-          }, 1000)
-        } else {
-          ElMessage.error(response.data.status_msg || '验证码发送失败')
-        }
-      } catch (error) {
-        console.error('Send code error:', error)
-        ElMessage.error('验证码发送失败，请重试')
-      } finally {
-        codeLoading.value = false
-      }
-    }
-
     const handleRegister = async () => {
       try {
         await registerFormRef.value.validate()
         loading.value = true
         const response = await api.post('/user/register', {
-              email: registerForm.email,
-              captcha: registerForm.captcha,
-              password: registerForm.password
+          email: registerForm.email,
+          password: registerForm.password
         })
         if (response.data.status_code === 1000) {
           ElMessage.success('注册成功，请登录')
@@ -182,11 +127,8 @@ export default {
     return {
       registerFormRef,
       loading,
-      codeLoading,
-      countdown,
       registerForm,
       registerRules,
-      sendCode,
       handleRegister
     }
   }

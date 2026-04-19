@@ -32,13 +32,24 @@ func (m *AIHelperManager) GetOrCreateAIHelper(userName string, sessionID string,
 		m.helpers[userName] = userHelpers
 	}
 
-	// 检查会话是否已存在
-	helper, exists := userHelpers[sessionID]
-	if exists {
-		return helper, nil
+	// 会话已存在：若前端切换了模型类型，必须换新 Helper，否则会一直用首次创建的模型（例如选了 RAG 实际仍走普通百炼）
+	if helper, exists := userHelpers[sessionID]; exists {
+		if helper.GetModelType() == modelType {
+			return helper, nil
+		}
+		oldMsgs := helper.GetMessages()
+		factory := GetGlobalFactory()
+		newHelper, err := factory.CreateAIHelper(ctx, modelType, sessionID, config)
+		if err != nil {
+			return nil, err
+		}
+		for _, msg := range oldMsgs {
+			newHelper.AddMessage(msg.Content, msg.UserName, msg.IsUser, false)
+		}
+		userHelpers[sessionID] = newHelper
+		return newHelper, nil
 	}
 
-	// 创建新的AIHelper
 	factory := GetGlobalFactory()
 	helper, err := factory.CreateAIHelper(ctx, modelType, sessionID, config)
 	if err != nil {

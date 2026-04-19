@@ -10,6 +10,9 @@ import (
 	"GopherAI/utils/myjwt"
 )
 
+// enableRegisterCaptcha 为 false 时跳过邮箱验证码校验（临时关闭，恢复注册验证码时改为 true）
+const enableRegisterCaptcha = false
+
 func Login(username, password string) (string, code.Code) {
 	var userInformation *model.User
 	var ok bool
@@ -41,9 +44,11 @@ func Register(email, password, captcha string) (string, code.Code) {
 		return "", code.CodeUserExist
 	}
 
-	//2:从redis中验证验证码是否有效
-	if ok, _ := myredis.CheckCaptchaForEmail(email, captcha); !ok {
-		return "", code.CodeInvalidCaptcha
+	//2:从redis中验证验证码是否有效（可通过 enableRegisterCaptcha 临时关闭）
+	if enableRegisterCaptcha {
+		if ok, _ := myredis.CheckCaptchaForEmail(email, captcha); !ok {
+			return "", code.CodeInvalidCaptcha
+		}
 	}
 
 	//3：生成11位的账号

@@ -1,175 +1,299 @@
 package rag
 
 import (
-	"GopherAI/common/redis"
-	redisPkg "GopherAI/common/redis"
+	"GopherAI/common/milvus"
 	"GopherAI/config"
 	"context"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
+	"github.com/bytedance/sonic"
 	embeddingArk "github.com/cloudwego/eino-ext/components/embedding/ark"
-	redisIndexer "github.com/cloudwego/eino-ext/components/indexer/redis"
-	redisRetriever "github.com/cloudwego/eino-ext/components/retriever/redis"
+	idxmilvus "github.com/cloudwego/eino-ext/components/indexer/milvus"
+	retmilvus "github.com/cloudwego/eino-ext/components/retriever/milvus"
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
-	redisCli "github.com/redis/go-redis/v9"
+	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 )
 
+// RAGIndexer 基于 Milvus 的向量写入（替代 Redis RediSearch）
 type RAGIndexer struct {
 	embedding embedding.Embedder
-	indexer   *redisIndexer.Indexer
+	indexer   *idxmilvus.Indexer
 }
 
+// RAGQuery 检索 + 同一 username/filename 过滤
 type RAGQuery struct {
-	embedding embedding.Embedder
-	retriever retriever.Retriever
+	retriever        retriever.Retriever
+	filterExpr       string
+	fallbackFilePath string // 当前 RAG 文件本地路径；向量检索失败时用全文兜底
 }
 
-// 构建知识库索引
-// 专业说法：文本解析、文本切块、向量化、存储向量
-// 通俗理解：把“人能读的文档”，转换成“AI 能按语义搜索的格式”，并存起来
-func NewRAGIndexer(filename, embeddingModel string) (*RAGIndexer, error) {
+// maxRAGFallbackChars 全文兜底时的最大字符数，避免超长简历撑爆上下文
+const maxRAGFallbackChars = 120000
 
-	// 用于控制整个初始化流程（超时 / 取消等），这里先用默认背景即可
-	ctx := context.Background()
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
 
-	// 从环境变量中读取调用向量模型所需的 API Key
-	apiKey := os.Getenv("OPENAI_API_KEY")
+// floatVectorSearchConverter 将查询嵌入转为 FloatVector。
+// eino-ext Milvus Retriever 默认使用 BinaryVector，与本项目集合的 FieldTypeFloatVector（写入侧为 float32）不一致，
+// 会导致向量检索始终 0 条，进而 RAG 静默退回「无文档」的普通对话。
+func floatVectorSearchConverter() func(ctx context.Context, vectors [][]float64) ([]entity.Vector, error) {
+	return func(ctx context.Context, vectors [][]float64) ([]entity.Vector, error) {
+		out := make([]entity.Vector, 0, len(vectors))
+		for _, v := range vectors {
+			f32 := make([]float32, len(v))
+			for i, x := range v {
+				f32[i] = float32(x)
+			}
+			out = append(out, entity.FloatVector(f32))
+		}
+		return out, nil
+	}
+}
 
-	// 向量的维度大小（等于向量模型输出的数字个数）
-	// Redis 在创建向量索引时必须提前知道这个值
-	dimension := config.GetConfig().RagModelConfig.RagDimension
+// pickLatestUserRagFile 选取用户 uploads 目录下最近修改的非目录文件（与「每用户单文件」策略一致）。
+func pickLatestUserRagFile(username string) (filename string, fullPath string, err error) {
+	userDir := filepath.Join("uploads", username)
+	entries, err := os.ReadDir(userDir)
+	if err != nil || len(entries) == 0 {
+		return "", "", fmt.Errorf("no uploaded file found for user %s", username)
+	}
+	type fi struct {
+		name    string
+		path    string
+		modUnix int64
+	}
+	var files []fi
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		p := filepath.Join(userDir, e.Name())
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		files = append(files, fi{name: e.Name(), path: p, modUnix: st.ModTime().Unix()})
+	}
+	if len(files) == 0 {
+		return "", "", fmt.Errorf("no valid file found for user %s", username)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modUnix > files[j].modUnix })
+	return files[0].name, files[0].path, nil
+}
 
-	// 1. 配置并创建“向量生成器”（Embedding）
-	// 可以理解为：找一个“翻译官”，
-	// 专门负责把文本翻译成 AI 能理解的“向量表示”
-	embedConfig := &embeddingArk.EmbeddingConfig{
-		BaseURL: config.GetConfig().RagModelConfig.RagBaseUrl, // 向量模型服务地址
-		APIKey:  apiKey,                                       // 鉴权信息
-		Model:   embeddingModel,                               // 使用哪个向量模型
+func ragCollectionFields(dim int64) []*entity.Field {
+	return []*entity.Field{
+		entity.NewField().
+			WithName("id").
+			WithDescription("doc id").
+			WithIsPrimaryKey(true).
+			WithDataType(entity.FieldTypeVarChar).
+			WithMaxLength(512),
+		entity.NewField().
+			WithName("vector").
+			WithDescription("embedding").
+			WithIsPrimaryKey(false).
+			WithDataType(entity.FieldTypeFloatVector).
+			WithDim(dim),
+		entity.NewField().
+			WithName("content").
+			WithDescription("text").
+			WithIsPrimaryKey(false).
+			WithDataType(entity.FieldTypeVarChar).
+			WithMaxLength(65535),
+		entity.NewField().
+			WithName("metadata").
+			WithDescription("json meta").
+			WithIsPrimaryKey(false).
+			WithDataType(entity.FieldTypeJSON),
+		entity.NewField().
+			WithName("username").
+			WithDescription("owner").
+			WithIsPrimaryKey(false).
+			WithDataType(entity.FieldTypeVarChar).
+			WithMaxLength(256),
+		entity.NewField().
+			WithName("filename").
+			WithDescription("blob file name").
+			WithIsPrimaryKey(false).
+			WithDataType(entity.FieldTypeVarChar).
+			WithMaxLength(512),
+	}
+}
+
+// gopherRow 与 ragCollectionFields 顺序、类型一致，供 InsertRows 使用
+type gopherRow struct {
+	ID       string    `json:"id" milvus:"name:id"`
+	Content  string    `json:"content" milvus:"name:content"`
+	Vector   []float32 `json:"vector" milvus:"name:vector"`
+	Metadata []byte    `json:"metadata" milvus:"name:metadata"`
+	Username string    `json:"username" milvus:"name:username"`
+	Filename string    `json:"filename" milvus:"name:filename"`
+}
+
+func docToRows(username, filename string) func(ctx context.Context, docs []*schema.Document, vectors [][]float64) ([]interface{}, error) {
+	return func(ctx context.Context, docs []*schema.Document, vectors [][]float64) ([]interface{}, error) {
+		out := make([]interface{}, 0, len(docs))
+		for i, doc := range docs {
+			md, err := sonic.Marshal(doc.MetaData)
+			if err != nil {
+				return nil, err
+			}
+			vf := make([]float32, len(vectors[i]))
+			for j, v := range vectors[i] {
+				vf[j] = float32(v)
+			}
+			out = append(out, &gopherRow{
+				ID:       doc.ID,
+				Content:  doc.Content,
+				Vector:   vf,
+				Metadata: md,
+				Username: username,
+				Filename: filename,
+			})
+		}
+		return out, nil
+	}
+}
+
+// NewRAGIndexer username + 磁盘上的文件名（uuid.ext），用于 Milvus 标量过滤与删除
+func NewRAGIndexer(username, filename, embeddingModel string) (*RAGIndexer, error) {
+	mc := milvus.Client()
+	if mc == nil {
+		return nil, fmt.Errorf("milvus client is nil: configure milvusConfig.address and ensure milvus.Init in main")
 	}
 
-	// 创建向量生成器实例
-	// 后续所有文本的“向量化”都会通过它完成
+	ctx := context.Background()
+	apiKey := firstEnv("ALI_API_KEY", "OPENAI_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("embedding api key empty")
+	}
+
+	cfg := config.GetConfig()
+	dim := cfg.RagModelConfig.RagDimension
+	if dim <= 0 {
+		return nil, fmt.Errorf("rag dimension invalid in config")
+	}
+
+	embedConfig := &embeddingArk.EmbeddingConfig{
+		BaseURL: cfg.RagModelConfig.RagBaseUrl,
+		APIKey:  apiKey,
+		Model:   embeddingModel,
+	}
 	embedder, err := embeddingArk.NewEmbedder(ctx, embedConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedder: %w", err)
+		return nil, fmt.Errorf("create embedder: %w", err)
 	}
 
-	// ===============================
-	// 2. 初始化 Redis 中的向量索引结构
-	// ===============================
-	// 可以理解为：先在 Redis 里建好“仓库”，
-	// 告诉它以后要存向量，并且每个向量的维度是多少
-	if err := redisPkg.InitRedisIndex(ctx, filename, dimension); err != nil {
-		return nil, fmt.Errorf("failed to init redis index: %w", err)
+	coll := cfg.Milvus.Collection
+	if coll == "" {
+		coll = "gopherai_rag"
 	}
 
-	// 获取 Redis 客户端，用于后续数据写入
-	rdb := redisPkg.Rdb
-
-	// ===============================
-	// 3. 配置索引器（定义：文档如何被存进 Redis）
-	// ===============================
-	indexerConfig := &redisIndexer.IndexerConfig{
-		Client:    rdb,                                     // Redis 客户端
-		KeyPrefix: redis.GenerateIndexNamePrefix(filename), // 不同知识库使用不同前缀，避免冲突
-		BatchSize: 10,                                      // 批量处理文档，提高写入效率
-
-		// 定义：一段文档（Document）在 Redis 中该如何存储
-		DocumentToHashes: func(ctx context.Context, doc *schema.Document) (*redisIndexer.Hashes, error) {
-
-			// 从文档的元数据中取出来源信息（例如文件名、URL）
-			source := ""
-			if s, ok := doc.MetaData["source"].(string); ok {
-				source = s
-			}
-
-			// 构造 Redis 中实际存储的数据结构（Hash）
-			return &redisIndexer.Hashes{
-				// Redis Key，一般由“知识库名 + 文档块 ID”组成
-				Key: fmt.Sprintf("%s:%s", filename, doc.ID),
-
-				// Redis Hash 中的字段
-				Field2Value: map[string]redisIndexer.FieldValue{
-					// content：原始文本内容
-					// EmbedKey 表示：该字段需要先做向量化，
-					// 生成的向量会存入名为 "vector" 的字段中
-					"content": {Value: doc.Content, EmbedKey: "vector"},
-
-					// metadata：一些辅助信息，不参与向量计算
-					"metadata": {Value: source},
-				},
-			}, nil
-		},
+	idxCfg := &idxmilvus.IndexerConfig{
+		Client:              mc,
+		Collection:          coll,
+		Description:         "GopherAI RAG",
+		Fields:              ragCollectionFields(int64(dim)),
+		Embedding:           embedder,
+		MetricType:          idxmilvus.COSINE,
+		DocumentConverter:   docToRows(username, filename),
+		EnableDynamicSchema: false,
 	}
 
-	// 将“向量生成器”交给索引器
-	// 这样索引器在写入文本时，可以自动完成向量计算
-	indexerConfig.Embedding = embedder
-
-	// ===============================
-	// 4. 创建最终可用的索引器实例
-	// ===============================
-	// 此时索引器已经具备：
-	// - 文本 → 向量 的能力
-	// - 向量写入 Redis 的能力
-	idx, err := redisIndexer.NewIndexer(ctx, indexerConfig)
+	idx, err := idxmilvus.NewIndexer(ctx, idxCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create indexer: %w", err)
+		return nil, fmt.Errorf("milvus indexer: %w", err)
 	}
 
-	// 返回一个封装好的 RAGIndexer，
-	// 后续只需要调用它，就可以把文档加入知识库
 	return &RAGIndexer{
 		embedding: embedder,
 		indexer:   idx,
 	}, nil
 }
 
-// IndexFile 读取文件内容并创建向量索引
+// IndexFile 读取文件并向 Milvus 写入向量
 func (r *RAGIndexer) IndexFile(ctx context.Context, filePath string) error {
-	// 读取文件内容
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("read file: %w", err)
 	}
 
-	// 将文件内容转换为文档
-	// TODO: 这里可以根据需要进行文本切块，目前简单处理为一个文档
 	doc := &schema.Document{
-		ID:      "doc_1", // 可以使用 UUID 或其他唯一标识
+		ID:      "doc_1",
 		Content: string(content),
 		MetaData: map[string]any{
 			"source": filePath,
 		},
 	}
 
-	// 使用 indexer 存储文档（会自动进行向量化）
 	_, err = r.indexer.Store(ctx, []*schema.Document{doc})
 	if err != nil {
-		return fmt.Errorf("failed to store document: %w", err)
-	}
-
-	return nil
-}
-
-// DeleteIndex 删除指定文件的知识库索引（静态方法，不依赖实例）
-func DeleteIndex(ctx context.Context, filename string) error {
-	if err := redisPkg.DeleteRedisIndex(ctx, filename); err != nil {
-		return fmt.Errorf("failed to delete redis index: %w", err)
+		return fmt.Errorf("milvus store: %w", err)
 	}
 	return nil
 }
 
-// NewRAGQuery 创建 RAG 查询器（用于向量检索和问答）
+func escapeMilvusStr(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+	return s
+}
+
+// DeleteIndex 按 username + filename 删除向量（上传新文件前清理旧数据）
+func DeleteIndex(ctx context.Context, username, filename string) error {
+	mc := milvus.Client()
+	if mc == nil {
+		return nil
+	}
+	coll := config.GetConfig().Milvus.Collection
+	if coll == "" {
+		coll = "gopherai_rag"
+	}
+	expr := fmt.Sprintf(`username == '%s' && filename == '%s'`, escapeMilvusStr(username), escapeMilvusStr(filename))
+	if err := mc.Delete(ctx, coll, "", expr); err != nil {
+		return fmt.Errorf("milvus delete: %w", err)
+	}
+	return nil
+}
+
+// NewRAGQuery 创建检索器；检索时带上 username/filename 过滤，避免串库。
+// 未连接 Milvus 时仍可根据本地已上传文件做全文 RAG（仅兜底路径，不进行向量检索）。
 func NewRAGQuery(ctx context.Context, username string) (*RAGQuery, error) {
-	cfg := config.GetConfig()
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	filename, fallbackAbs, err := pickLatestUserRagFile(username)
+	if err != nil {
+		return nil, err
+	}
 
-	// 创建 embedding 模型
+	mc := milvus.Client()
+	if mc == nil {
+		log.Printf("[rag] milvus client nil, full-file RAG only (user=%s file=%s)", username, filename)
+		return &RAGQuery{
+			retriever:        nil,
+			filterExpr:       "",
+			fallbackFilePath: fallbackAbs,
+		}, nil
+	}
+
+	cfg := config.GetConfig()
+	apiKey := firstEnv("ALI_API_KEY", "OPENAI_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("embedding api key empty")
+	}
+
 	embedConfig := &embeddingArk.EmbeddingConfig{
 		BaseURL: cfg.RagModelConfig.RagBaseUrl,
 		APIKey:  apiKey,
@@ -177,76 +301,94 @@ func NewRAGQuery(ctx context.Context, username string) (*RAGQuery, error) {
 	}
 	embedder, err := embeddingArk.NewEmbedder(ctx, embedConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedder: %w", err)
+		return nil, fmt.Errorf("embedder: %w", err)
 	}
 
-	// 获取用户上传的文件名（假设每个用户只有一个文件）
-	// 这里需要从用户目录读取文件名
-	userDir := fmt.Sprintf("uploads/%s", username)
-	files, err := os.ReadDir(userDir)
-	if err != nil || len(files) == 0 {
-		return nil, fmt.Errorf("no uploaded file found for user %s", username)
+	coll := cfg.Milvus.Collection
+	if coll == "" {
+		coll = "gopherai_rag"
 	}
 
-	var filename string
-	for _, f := range files {
-		if !f.IsDir() {
-			filename = f.Name()
-			break
-		}
-	}
+	filterExpr := fmt.Sprintf(`username == '%s' && filename == '%s'`, escapeMilvusStr(username), escapeMilvusStr(filename))
 
-	if filename == "" {
-		return nil, fmt.Errorf("no valid file found for user %s", username)
-	}
-
-	// 创建 retriever
-	rdb := redisPkg.Rdb
-	indexName := redis.GenerateIndexName(filename)
-
-	retrieverConfig := &redisRetriever.RetrieverConfig{
-		Client:       rdb,
-		Index:        indexName,
-		Dialect:      2,
-		ReturnFields: []string{"content", "metadata", "distance"},
-		TopK:         5,
-		VectorField:  "vector",
-		DocumentConverter: func(ctx context.Context, doc redisCli.Document) (*schema.Document, error) {
-			resp := &schema.Document{
-				ID:       doc.ID,
-				Content:  "",
-				MetaData: map[string]any{},
-			}
-			for field, val := range doc.Fields {
-				if field == "content" {
-					resp.Content = val
-				} else {
-					resp.MetaData[field] = val
-				}
-			}
-			return resp, nil
-		},
-	}
-	retrieverConfig.Embedding = embedder
-
-	rtr, err := redisRetriever.NewRetriever(ctx, retrieverConfig)
+	// eino-ext 默认 SearchParam 会 AddRadius(向量维度)+range_filter，易导致 COSINE 搜索 0 条；此处仅用 level，由 Milvus 侧默认检索行为决定召回
+	searchSp, err := entity.NewIndexAUTOINDEXSearchParam(1)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create retriever: %w", err)
+		return nil, fmt.Errorf("search param: %w", err)
+	}
+
+	retCfg := &retmilvus.RetrieverConfig{
+		Client:           mc,
+		Collection:       coll,
+		VectorField:      "vector",
+		OutputFields:     []string{"id", "content", "metadata", "username", "filename"},
+		MetricType:       entity.COSINE,
+		TopK:             5,
+		Embedding:        embedder,
+		VectorConverter: floatVectorSearchConverter(),
+		Sp:              searchSp,
+	}
+
+	rtr, err := retmilvus.NewRetriever(ctx, retCfg)
+	if err != nil {
+		log.Printf("[rag] milvus NewRetriever failed, file-only RAG: %v", err)
+		return &RAGQuery{
+			retriever:        nil,
+			filterExpr:       "",
+			fallbackFilePath: fallbackAbs,
+		}, nil
 	}
 
 	return &RAGQuery{
-		embedding: embedder,
-		retriever: rtr,
+		retriever:        rtr,
+		filterExpr:       filterExpr,
+		fallbackFilePath: fallbackAbs,
 	}, nil
 }
 
-// RetrieveDocuments 检索相关文档
+
+// RetrieveDocuments 语义检索（仅当前用户当前文件）；Milvus 无结果或报错时读取本地文件全文兜底，保证「有上传即可答」。
 func (r *RAGQuery) RetrieveDocuments(ctx context.Context, query string) ([]*schema.Document, error) {
-	docs, err := r.retriever.Retrieve(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve documents: %w", err)
+	var lastMilvusErr error
+	if r.retriever != nil {
+		docs, err := r.retriever.Retrieve(ctx, query, retmilvus.WithFilter(r.filterExpr))
+		if err == nil && len(docs) > 0 {
+			return docs, nil
+		}
+		lastMilvusErr = err
+		if err != nil {
+			log.Printf("[rag] milvus retrieve error, fallback to local file: %v", err)
+		} else {
+			log.Printf("[rag] milvus returned 0 docs, fallback to local file")
+		}
+	} else {
+		log.Printf("[rag] using local full-file fallback (milvus unavailable or disabled)")
 	}
-	return docs, nil
+
+	if r.fallbackFilePath == "" {
+		if lastMilvusErr != nil {
+			return nil, fmt.Errorf("retrieve: %w", lastMilvusErr)
+		}
+		return nil, fmt.Errorf("retrieve: no local file for RAG fallback")
+	}
+	b, rerr := os.ReadFile(r.fallbackFilePath)
+	if rerr != nil {
+		if lastMilvusErr != nil {
+			return nil, fmt.Errorf("retrieve: %w; fallback read: %v", lastMilvusErr, rerr)
+		}
+		return nil, fmt.Errorf("fallback read: %w", rerr)
+	}
+	text := string(b)
+	if len([]rune(text)) > maxRAGFallbackChars {
+		rs := []rune(text)
+		text = string(rs[:maxRAGFallbackChars]) + "\n\n... [内容已截断，仅展示前 " + fmt.Sprint(maxRAGFallbackChars) + " 字]"
+		log.Printf("[rag] fallback text truncated to %d runes", maxRAGFallbackChars)
+	}
+	return []*schema.Document{{
+		ID:       "local_fulltext_fallback",
+		Content:  text,
+		MetaData: map[string]any{"source": r.fallbackFilePath, "fallback": true},
+	}}, nil
 }
 
 // BuildRAGPrompt 构建包含检索文档的提示词
@@ -260,7 +402,7 @@ func BuildRAGPrompt(query string, docs []*schema.Document) string {
 		contextText += fmt.Sprintf("[文档 %d]: %s\n\n", i+1, doc.Content)
 	}
 
-	prompt := fmt.Sprintf(`基于以下参考文档回答用户的问题。如果文档中没有相关信息，请说明无法找到相关信息。
+	return fmt.Sprintf(`基于以下参考文档回答用户的问题。如果文档中没有相关信息，请说明无法找到相关信息。
 
 参考文档：
 %s
@@ -268,6 +410,4 @@ func BuildRAGPrompt(query string, docs []*schema.Document) string {
 用户问题：%s
 
 请提供准确、完整的回答：`, contextText, query)
-
-	return prompt
 }

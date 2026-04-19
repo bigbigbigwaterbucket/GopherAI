@@ -69,15 +69,20 @@ func CheckCaptchaForEmail(email, userInput string) (bool, error) {
 func InitRedisIndex(ctx context.Context, filename string, dimension int) error {
 	indexName := GenerateIndexName(filename)
 
-	// 检查索引是否存在
+	// 检查索引是否存在（依赖 RediSearch：FT.*，需 Redis Stack，不可用裸 Redis）
 	_, err := Rdb.Do(ctx, "FT.INFO", indexName).Result()
 	if err == nil {
 		fmt.Println("索引已存在，跳过创建")
 		return nil
 	}
 
+	errStr := err.Error()
+	if strings.Contains(errStr, "unknown command") && strings.Contains(strings.ToUpper(errStr), "FT") {
+		return fmt.Errorf("当前 Redis 不支持 RediSearch（缺少 FT.*）。RAG 向量索引请使用 Redis Stack：例如 Docker 镜像 redis/redis-stack-server，端口保持与 config.toml 一致；原始错误: %w", err)
+	}
+
 	// 如果索引不存在，创建新索引
-	if !strings.Contains(err.Error(), "Unknown index name") {
+	if !strings.Contains(errStr, "Unknown index name") {
 		return fmt.Errorf("检查索引失败: %w", err)
 	}
 

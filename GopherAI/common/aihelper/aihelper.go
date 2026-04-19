@@ -1,7 +1,7 @@
 package aihelper
 
 import (
-	"GopherAI/common/rabbitmq"
+	"GopherAI/common/kafka"
 	"GopherAI/model"
 	"GopherAI/utils"
 	"context"
@@ -25,8 +25,8 @@ func NewAIHelper(model_ AIModel, SessionID string) *AIHelper {
 		messages: make([]*model.Message, 0),
 		//异步推送到消息队列中
 		saveFunc: func(msg *model.Message) (*model.Message, error) {
-			data := rabbitmq.GenerateMessageMQParam(msg.SessionID, msg.Content, msg.UserName, msg.IsUser)
-			err := rabbitmq.RMQMessage.Publish(data)
+			data := kafka.GenerateMessageMQParam(msg.SessionID, msg.Content, msg.UserName, msg.IsUser)
+			err := kafka.Publish(data)
 			return msg, err
 		},
 		SessionID: SessionID,

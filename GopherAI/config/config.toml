@@ -15,9 +15,9 @@ db = 0
 
 [mysqlConfig]
 host = "127.0.0.1"
-port = 3306
+port = 13316
 user = "root"
-password = "123456"
+password = "root"
 databaseName = "GopherAI"
 charset =  "utf8mb4"
 
@@ -27,12 +27,17 @@ charset =  "utf8mb4"
  subject= "GopherAI"
  key= "GopherAI-v1"
 
- [rabbitmqConfig]
-  host= "rabbitmq"
-  port= 5672
-  username= "root"
-  password= "123456"
-  vhost= "/"
+
+[kafkaConfig]
+brokers = ["127.0.0.1:9092"]
+topic = "gopherai_message"
+consumerGroup = "gopherai-message-worker"
+
+[milvusConfig]
+address = "127.0.0.1:19530"
+username = ""
+password = ""
+collection = "gopherai_rag"
 
  [ragModelConfig]
   embeddingModel= "text-embedding-v4"

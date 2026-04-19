@@ -31,7 +31,7 @@ func Auth() gin.HandlerFunc {
 			return
 		}
 
-		log.Println("token is ", token)
+		log.Println("jwt token is ", token)
 		userName, ok := myjwt.ParseToken(token)
 		if !ok {
 			c.JSON(http.StatusOK, res.CodeOf(code.CodeInvalidToken))

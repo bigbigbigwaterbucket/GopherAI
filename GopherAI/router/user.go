@@ -10,6 +10,7 @@ func RegisterUserRouter(r *gin.RouterGroup) {
 	{
 		r.POST("/register", user.Register)
 		r.POST("/login", user.Login)
-		r.POST("/captcha", user.HandleCaptcha)
+		// 验证码接口已临时关闭，与 enableRegisterCaptcha 一并恢复
+		// r.POST("/captcha", user.HandleCaptcha)
 	}
 }

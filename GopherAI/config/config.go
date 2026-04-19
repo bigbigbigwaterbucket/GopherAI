@@ -40,12 +40,10 @@ type JwtConfig struct {
 	Key            string `toml:"key"`
 }
 
-type Rabbitmq struct {
-	RabbitmqPort     int    `toml:"port"`
-	RabbitmqHost     string `toml:"host"`
-	RabbitmqUsername string `toml:"username"`
-	RabbitmqPassword string `toml:"password"`
-	RabbitmqVhost    string `toml:"vhost"`
+type KafkaConfig struct {
+	Brokers       []string `toml:"brokers"`
+	Topic         string   `toml:"topic"`
+	ConsumerGroup string   `toml:"consumerGroup"`
 }
 
 type RagModelConfig struct {
@@ -61,15 +59,24 @@ type VoiceServiceConfig struct {
 	VoiceServiceSecretKey string `toml:"voiceServiceSecretKey"`
 }
 
+// MilvusConfig RAG 向量存储（替代 Redis FT.*）
+type MilvusConfig struct {
+	Address    string `toml:"address"`    // 如 127.0.0.1:19530
+	Username   string `toml:"username"` // 可选，单机常为空
+	Password   string `toml:"password"`
+	Collection string `toml:"collection"` // 集合名，默认 gopherai_rag
+}
+
 type Config struct {
 	EmailConfig        `toml:"emailConfig"`
 	RedisConfig        `toml:"redisConfig"`
 	MysqlConfig        `toml:"mysqlConfig"`
 	JwtConfig          `toml:"jwtConfig"`
 	MainConfig         `toml:"mainConfig"`
-	Rabbitmq           `toml:"rabbitmqConfig"`
+	Kafka              KafkaConfig `toml:"kafkaConfig"`
 	RagModelConfig     `toml:"ragModelConfig"`
 	VoiceServiceConfig `toml:"voiceServiceConfig"`
+	Milvus             MilvusConfig `toml:"milvusConfig"`
 }
 
 type RedisKeyConfig struct {

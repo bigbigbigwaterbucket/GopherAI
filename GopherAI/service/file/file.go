@@ -34,8 +34,8 @@ func UploadRagFile(username string, file *multipart.FileHeader) (string, error) 
 		for _, f := range files {
 			if !f.IsDir() {
 				filename := f.Name()
-				// 删除该文件对应的 Redis 索引
-				if err := rag.DeleteIndex(context.Background(), filename); err != nil {
+				// 删除该文件在 Milvus 中的向量
+				if err := rag.DeleteIndex(context.Background(), username, filename); err != nil {
 					log.Printf("Failed to delete index for %s: %v", filename, err)
 					// 继续执行，不因为索引删除失败而中断文件上传
 				}
@@ -79,7 +79,7 @@ func UploadRagFile(username string, file *multipart.FileHeader) (string, error) 
 	log.Printf("File uploaded successfully: %s", filePath)
 
 	// 创建 RAG 索引器并对文件进行向量化
-	indexer, err := rag.NewRAGIndexer(filename, config.GetConfig().RagModelConfig.RagEmbeddingModel)
+	indexer, err := rag.NewRAGIndexer(username, filename, config.GetConfig().RagModelConfig.RagEmbeddingModel)
 	if err != nil {
 		log.Printf("Failed to create RAG indexer: %v", err)
 		// 删除已上传的文件
@@ -92,7 +92,7 @@ func UploadRagFile(username string, file *multipart.FileHeader) (string, error) 
 		log.Printf("Failed to index file: %v", err)
 		// 删除已上传的文件和索引
 		os.Remove(filePath)
-		rag.DeleteIndex(context.Background(), filename)
+		rag.DeleteIndex(context.Background(), username, filename)
 		return "", err
 	}
 

@@ -261,10 +261,26 @@ export default {
     }
 
 
+    const formatSendError = (err) => {
+      if (!err) return '发送失败，请重试'
+      const msg = err.response?.data?.status_msg
+      if (msg) return msg
+      if (err.response?.status === 401) return '登录已过期，请重新登录'
+      if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
+        return '无法连接后端：请确认已启动 Go 服务（默认 :9090），且前端代理与 vue.config.js 一致'
+      }
+      return err.message || '发送失败，请重试'
+    }
+
     const sendMessage = async () => {
       if (!inputMessage.value || !inputMessage.value.trim()) {
         ElMessage.warning('请输入消息内容')
         return
+      }
+
+      // 未选会话且非临时会话时，先进入「新聊天」，避免访问 sessions.value[null] 抛错
+      if (!tempSession.value && !currentSessionId.value) {
+        createNewSession()
       }
 
       const userMessage = {
@@ -290,7 +306,7 @@ export default {
         }
       } catch (err) {
         console.error('Send message error:', err)
-        ElMessage.error('发送失败，请重试')
+        ElMessage.error(formatSendError(err))
 
         if (!tempSession.value && currentSessionId.value && sessions.value[currentSessionId.value] && sessions.value[currentSessionId.value].messages) {
 
@@ -481,8 +497,13 @@ export default {
           currentMessages.value.pop()
         }
       } else {
-
-        const sessionMsgs = sessions.value[currentSessionId.value].messages
+        const sess = sessions.value[currentSessionId.value]
+        if (!sess || !Array.isArray(sess.messages)) {
+          ElMessage.error('会话状态异常，请点击「新聊天」或重新选择左侧会话')
+          currentMessages.value.pop()
+          return
+        }
+        const sessionMsgs = sess.messages
 
         sessionMsgs.push({ role: 'user', content: question })
 
@@ -563,8 +584,10 @@ export default {
       }
     }
 
-    onMounted(() => {
-      loadSessions()
+    onMounted(async () => {
+      await loadSessions()
+      // 默认进入「新聊天」临时会话，否则未选会话时发消息会访问 sessions[null] 报错
+      createNewSession()
     })
 
     // expose to template

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+
 	"GopherAI/common/aihelper"
 	"GopherAI/common/mysql"
-	"GopherAI/common/rabbitmq"
+	"GopherAI/common/kafka"
+	milvusstore "GopherAI/common/milvus"
 	"GopherAI/common/redis"
 	"GopherAI/config"
 	"GopherAI/dao/message"
@@ -64,8 +67,13 @@ func main() {
 	//初始化redis
 	redis.Init()
 	log.Println("redis init success  ")
-	rabbitmq.InitRabbitMQ()
-	log.Println("rabbitmq init success  ")
+	kafka.InitKafka()
+	log.Println("kafka init success")
+
+	if err := milvusstore.Init(context.Background()); err != nil {
+		log.Println("milvus init error: " + err.Error())
+		return
+	}
 
 	err := StartServer(host, port) // 启动 HTTP 服务
 	if err != nil {
