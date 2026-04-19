@@ -1,6 +1,8 @@
 package user
 
 import (
+	"log"
+
 	"GopherAI/common/code"
 	myemail "GopherAI/common/email"
 	myredis "GopherAI/common/redis"
@@ -12,6 +14,10 @@ import (
 
 // enableRegisterCaptcha 为 false 时跳过邮箱验证码校验（临时关闭，恢复注册验证码时改为 true）
 const enableRegisterCaptcha = false
+
+// enableRegisterWelcomeEmail 为 true 时，注册成功后会通过 SMTP 把随机账号发到用户邮箱。
+// 关闭验证码期间若 QQ 邮箱未开通 SMTP / 授权码不对会报 535，此前会导致注册仍返回失败——本地开发请保持 false。
+const enableRegisterWelcomeEmail = false
 
 func Login(username, password string) (string, code.Code) {
 	var userInformation *model.User
@@ -39,8 +45,8 @@ func Register(email, password, captcha string) (string, code.Code) {
 	var ok bool
 	var userInformation *model.User
 
-	//1:先判断用户是否已经存在了
-	if ok, _ := user.IsExistUser(email); ok {
+	//1:先判断该邮箱是否已注册（用户名是随机数字，必须用 email 查重）
+	if ok, _ := user.IsExistEmail(email); ok {
 		return "", code.CodeUserExist
 	}
 
@@ -59,9 +65,11 @@ func Register(email, password, captcha string) (string, code.Code) {
 		return "", code.CodeServerBusy
 	}
 
-	//5：将账号一并发送到对应邮箱上去，后续需要账号登录
-	if err := myemail.SendCaptcha(email, username, user.UserNameMsg); err != nil {
-		return "", code.CodeServerBusy
+	//5：可选：把随机账号发到邮箱（与验证码无关；失败不应挡注册）
+	if enableRegisterWelcomeEmail {
+		if err := myemail.SendCaptcha(email, username, user.UserNameMsg); err != nil {
+			log.Printf("[register] welcome email send failed (user still created): %v", err)
+		}
 	}
 
 	// 6:生成Token
